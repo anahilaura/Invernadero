@@ -1,0 +1,160 @@
+import os
+import asyncio
+import configparser
+from counterfit_connection import CounterFitConnection
+from counterfit_shims_grove.adc import ADC
+from counterfit_shims_grove.grove_relay import GroveRelay
+from counterfit_shims_seeed_python_dht import DHT
+import time
+import json
+import paho.mqtt.client as mqtt
+import uuid
+from iotc import (
+    IOTCConnectType,
+    IOTCLogLevel,
+    IOTCEvents,
+    Command,
+    CredentialsCache,
+    Storage,
+)
+from iotc.aio import IoTCClient
+
+# Inicialización de CounterFit
+CounterFitConnection.init('127.0.0.1', 5050)
+# Inicialización de ADC y relay
+adc = ADC()
+relay = GroveRelay(5)
+# Inicialización del sensor DHT11
+DHT_PIN = 0
+DHT_SENSOR = DHT("11",DHT_PIN)
+dht_sensor = DHT(DHT_SENSOR, DHT_PIN)
+# Generación del UUID único
+id = str(uuid.uuid4())
+# Configuración MQTT
+client_telemetry_topic_temp = id + '/telemetry_temperature'
+client_telemetry_topic_hum = id + '/telemetry_humidity'
+server_command_topic = id + '/commands'
+client_name = id + 'soilmoisturesensor_client'
+mqtt_client = mqtt.Client(client_name)
+# Valores de referencia (rangos saludables y tiempo de espera)
+TEMP_MAX_SAFE = 32
+TEMP_MIN_SAFE = 15
+HUM_MAX_SAFE = 80
+HUM_MIN_SAFE = 20
+TIME_WAIT = 10
+HIST_TEMP = 2
+HIST_HUM = 5
+COOLDOWN = 90
+last_relay_change = 0
+relay_state = False
+
+# Conexión a Azure IoT Central
+config = configparser.ConfigParser()
+config.read(os.path.join(os.path.dirname(__file__), "secret.ini"))
+
+device_id = config["DEVICE_DHT"]["DeviceId"]
+scope_id = config["DEVICE_DHT"]["ScopeId"]
+key = config["DEVICE_DHT"]["DeviceKey"]
+
+class MemStorage(Storage):
+    def retrieve(self):
+        return None
+    def persist(self, credentials):
+        return None
+
+client = IoTCClient(
+    device_id,
+    scope_id,
+    IOTCConnectType.IOTC_CONNECT_DEVICE_KEY,
+    key,
+    storage=MemStorage(),
+)
+
+client.set_log_level(IOTCLogLevel.IOTC_LOGGING_ALL)
+
+async def on_props(prop:property):
+    print(f"Received {prop.name}:{prop.value}")
+    return True
+
+async def on_commands(command: Command):
+    print("Received command {} with value {}".format(command.name, command.value))
+    await command.reply()
+
+async def on_enqueued_commands(command:Command):
+    print("Received offline command {} with value {}".format(command.name, command.value))
+
+client.on(IOTCEvents.IOTC_PROPERTIES, on_props)
+client.on(IOTCEvents.IOTC_COMMAND, on_commands)
+client.on(IOTCEvents.IOTC_ENQUEUED_COMMAND, on_enqueued_commands)
+
+def handle_command(client, userdata, message):
+    try:
+        payload = json.loads(message.payload.decode())
+        print("Message received:", payload)
+
+    except Exception as e:
+        print(f"Error handling command: {e}")
+
+mqtt_client.on_message = handle_command
+
+def check_control_relay(temperature):
+    global last_relay_change
+    global relay_state
+    current_time = time.time()
+
+    if current_time - last_relay_change > COOLDOWN:
+        temp_alta = temperature > TEMP_MAX_SAFE + HIST_TEMP
+        temp_alta_ok = TEMP_MAX_SAFE - HIST_TEMP < temperature <= TEMP_MAX_SAFE + HIST_TEMP
+        temp_baja = temperature < TEMP_MIN_SAFE - HIST_TEMP
+        temp_baja_ok = TEMP_MIN_SAFE + HIST_TEMP > temperature >= TEMP_MIN_SAFE - HIST_TEMP
+        # Si la temperatura es muy alta y el relay está apagado, abrir ventanas
+        if temp_alta and not relay_state:
+            relay.on()
+            relay_state = True
+            print("Temperatura muy alta. Relay ON (ventanas abiertas)")
+            last_relay_change = current_time
+        # Si la temperatura es alta pero aceptable y el relay está encendido, cerrar ventanas.
+        elif temp_alta_ok and relay_state:
+            relay.off()
+            relay_state = False
+            print("Temperatura dentro del límite superior aceptable. Relay OFF (ventanas cerradas)")
+            last_relay_change = current_time
+        # Si la temperatura es muy baja y el relay está encendido, cerrar ventanas.
+        elif temp_baja and relay_state:
+            relay.off()
+            relay_state = False
+            print("Temperatura muy baja. Relay OFF (ventanas cerradas)")
+            last_relay_change = current_time
+        # Si la temperatura es baja pero aceptable y el relay está apagado, enciéndelo para abrir ventanas.
+        elif temp_baja_ok and not relay_state:
+            relay.on()
+            relay_state = True
+            print("Temperatura dentro del límite inferior aceptable. Relay ON (ventanas abiertas)")
+            last_relay_change = current_time
+
+async def main():
+    await client.connect()
+    mqtt_client.connect('test.mosquitto.org')
+    mqtt_client.subscribe(server_command_topic)
+    mqtt_client.loop_start()
+
+    while not client.terminated():
+        if client.is_connected():
+            humidity, temperature = dht_sensor.read()
+            if humidity is not None and temperature is not None:
+                print(f"Temperatura: {temperature}C, Humedad: {humidity}%")
+                await client.send_telemetry(
+                    {
+                        "Temperatura": temperature,
+                        "Humedad": humidity
+                    }
+                )
+                mqtt_client.publish(client_telemetry_topic_temp, json.dumps({'temperature': temperature}))
+                mqtt_client.publish(client_telemetry_topic_hum, json.dumps({'humidity': humidity}))
+                check_control_relay(temperature)
+            else:
+                print("Error de lectura de valores ambientales.")    
+            time.sleep(TIME_WAIT)
+        await asyncio.sleep(3)
+
+asyncio.run(main())
